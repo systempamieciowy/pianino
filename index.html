@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Ćwiczenie nut (sekwencja) + MIDI</title>
+
+  <!-- OpenSheetMusicDisplay (MusicXML -> nuty) -->
+  <script src="https://unpkg.com/opensheetmusicdisplay@1.9.0/build/opensheetmusicdisplay.min.js"></script>
+
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 12px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    #osmd { width: 100%; border: 1px solid #ddd; border-radius: 8px; padding: 6px; overflow-x: auto; }
+    #log { white-space: pre-wrap; background: #fafafa; border: 1px solid #eee; border-radius: 8px; padding: 8px; }
+    button { padding: 8px 10px; }
+    small { color: #555; }
+  </style>
+</head>
+<body>
+  <h2>Ćwiczenie nut (sekwencja) + MIDI</h2>
+
+  <div class="row">
+    <label>
+      <strong>Plik MusicXML:</strong>
+      <input id="xmlFile" type="file" accept=".xml,.musicxml" />
+    </label>
+
+    <button id="btnMidi">Połącz MIDI (Chrome)</button>
+    <button id="btnStart" disabled>Start ćwiczenia</button>
+    <button id="btnReset" disabled>Reset</button>
+  </div>
+
+  <p>
+    <small>
+      Tryb: bez oceny czasu. Program czeka na poprawną nutę/akord i przechodzi dalej.
+      Akord rozpoznawany jako zestaw klawiszy wciśniętych naraz (z tolerancją ~120 ms).
+    </small>
+  </p>
+
+  <div id="osmd"></div>
+
+  <h3>Status</h3>
+  <div id="log">Wczytaj MusicXML, potem połącz MIDI.</div>
+
+<script>
+(() => {
+  const logEl = document.getElementById("log");
+  const xmlFileEl = document.getElementById("xmlFile");
+  const btnMidi = document.getElementById("btnMidi");
+  const btnStart = document.getElementById("btnStart");
+  const btnReset = document.getElementById("btnReset");
+
+  const osmdContainer = document.getElementById("osmd");
+  const osmd = new opensheetmusicdisplay.OpenSheetMusicDisplay(osmdContainer, {
+    autoResize: true,
+    drawTitle: true,
+    followCursor: true
+  });
+
+  let midiAccess = null;
+  let midiInput = null;
+
+  // Sekwencja oczekiwanych "zdarzeń": każde zdarzenie to Set numerów MIDI (akord = wiele)
+  let expectedEvents = [];
+  let currentIndex = 0;
+
+  // Bufor do wykrywania akordów: zbieramy NoteOn w krótkim oknie
+  let chordBuffer = new Set();
+  let chordTimer = null;
+  const CHORD_WINDOW_MS = 120;
+
+  function log(msg) {
+    logEl.textContent = msg;
+  }
+
+  // Konwersja pitch do numeru MIDI
+  // C4 = 60. W MusicXML OSMD zwykle daje octave + fundamental + accidental.
+  function pitchToMidi(pitch) {
+    // pitch: { FundamentalNote: "C".."B", Octave: number, Accidental: -2..2 }
+    const noteMap = { C:0, D:2, E:4, F:5, G:7, A:9, B:11 };
+    const base = noteMap[pitch.FundamentalNote];
+    const acc = pitch.Accidental ?? 0;
+    const octave = pitch.Octave;
+    return (octave + 1) * 12 + base + acc;
+  }
+
+  // Budowa sekwencji zdarzeń z OSMD:
+  // Idziemy kursorem po notach i zbieramy "aktualne nuty" w danej pozycji (akord).
+  function buildExpectedEventsFromOsmd() {
+    if (!osmd || !osmd.cursor) return [];
+
+    const events = [];
+    osmd.cursor.reset();
+
+    // OSMD cursor: na każdej pozycji są "notes under cursor"
+    // Zbieramy tylko dźwięczne nuty (bez pauz)
+    while (!osmd.cursor.iterator.EndReached) {
+      const notes = osmd.cursor.NotesUnderCursor || [];
+      const midiSet = new Set();
+
+      for (const n of notes) {
+        // n.Pitch może być null dla pauz
+        if (n && n.Pitch && n.Pitch.FundamentalNote) {
+          midiSet.add(pitchToMidi(n.Pitch));
+        }
+      }
+
+      if (midiSet.size > 0) events.push(midiSet);
+
+      osmd.cursor.next();
+    }
+
+    osmd.cursor.reset();
+    return events;
+  }
+
+  function highlightCurrent() {
+    // Cursor pokazuje aktualne miejsce; ustawiamy go na currentIndex
+    osmd.cursor.reset();
+    for (let i = 0; i < currentIndex; i++) osmd.cursor.next();
+    osmd.cursor.show();
+  }
+
+  function setsEqual(a, b) {
+    if (a.size !== b.size) return false;
+    for (const x of a) if (!b.has(x)) return false;
+    return true;
+  }
+
+  function processChord(chordSet) {
+    if (expectedEvents.length === 0) return;
+    if (currentIndex >= expectedEvents.length) {
+      log("Koniec. Wszystkie nuty/akordy zagrane.");
+      return;
+    }
+
+    const expected = expectedEvents[currentIndex];
+
+    if (setsEqual(chordSet, expected)) {
+      currentIndex++;
+      highlightCurrent();
+      log(`OK (${currentIndex}/${expectedEvents.length}). Oczekuję kolejnego dźwięku/akordu.`);
+      if (currentIndex >= expectedEvents.length) {
+        log("Koniec. Wszystkie nuty/akordy zagrane.");
+      }
+    } else {
+      // Minimalny feedback: pokazujemy różnicę
+      const exp = [...expected].sort((x,y)=>x-y).join(",");
+      const got = [...chordSet].sort((x,y)=>x-y).join(",");
+      log(`Nie. Oczekiwane: [${exp}]  | Zagrane: [${got}]`);
+    }
+  }
+
+  function onMidiMessage(e) {
+    const [status, data1, data2] = e.data;
+    const cmd = status & 0xF0;
+
+    const NOTE_ON = 0x90;
+    const NOTE_OFF = 0x80;
+
+    // NoteOn z velocity 0 traktujemy jak NoteOff
+    if (cmd === NOTE_ON && data2 > 0) {
+      chordBuffer.add(data1);
+
+      if (chordTimer) clearTimeout(chordTimer);
+      chordTimer = setTimeout(() => {
+        const chordSet = new Set(chordBuffer);
+        chordBuffer.clear();
+        processChord(chordSet);
+      }, CHORD_WINDOW_MS);
+    } else if (cmd === NOTE_OFF || (cmd === NOTE_ON && data2 === 0)) {
+      // w MVP ignorujemy NoteOff; sekwencja oparta na NoteOn
+    }
+  }
+
+  async function connectMidi() {
+    if (!("requestMIDIAccess" in navigator)) {
+      log("Brak Web MIDI API w tej przeglądarce. Użyj Chrome/Edge.");
+      return;
+    }
+    midiAccess = await navigator.requestMIDIAccess({ sysex: false });
+    const inputs = [...midiAccess.inputs.values()];
+    if (inputs.length === 0) {
+      log("Nie wykryto wejść MIDI. Podłącz pianino (USB-OTG) i spróbuj ponownie.");
+      return;
+    }
+
+    // Bierzemy pierwsze wejście; w wersji produkcyjnej dodasz listę wyboru
+    midiInput = inputs[0];
+    midiInput.onmidimessage = onMidiMessage;
+
+    log(`Połączono MIDI: ${midiInput.name || "wejście MIDI"}.`);
+  }
+
+  xmlFileEl.addEventListener("change", async () => {
+    const f = xmlFileEl.files?.[0];
+    if (!f) return;
+
+    const xmlText = await f.text();
+    await osmd.load(xmlText);
+    await osmd.render();
+
+    expectedEvents = buildExpectedEventsFromOsmd();
+    currentIndex = 0;
+
+    osmd.cursor.show();
+    highlightCurrent();
+
+    btnStart.disabled = expectedEvents.length === 0;
+    btnReset.disabled = expectedEvents.length === 0;
+
+    log(`Wczytano MusicXML. Zdarzeń do zagrania: ${expectedEvents.length}. Połącz MIDI i kliknij Start.`);
+  });
+
+  btnMidi.addEventListener("click", async () => {
+    try {
+      await connectMidi();
+    } catch (err) {
+      log("Błąd MIDI: " + (err?.message || String(err)));
+    }
+  });
+
+  btnStart.addEventListener("click", () => {
+    if (!midiInput) {
+      log("Najpierw połącz MIDI.");
+      return;
+    }
+    currentIndex = 0;
+    highlightCurrent();
+    log("Start. Zagraj pierwszą nutę/akord.");
+  });
+
+  btnReset.addEventListener("click", () => {
+    currentIndex = 0;
+    highlightCurrent();
+    log("Zresetowano. Zagraj pierwszą nutę/akord.");
+  });
+})();
+</script>
+</body>
+</html>

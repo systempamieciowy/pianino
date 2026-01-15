@@ -224,6 +224,7 @@
 
     log(`Wczytano MusicXML. Zdarzeń do zagrania: ${expectedEvents.length}. Połącz MIDI i kliknij Start.`);
   });
+btnMidi.addEventListener("click", () => log("Kliknięto Połącz MIDI (diagnostyka)."));
 
   btnMidi.addEventListener("click", async () => {
     try {

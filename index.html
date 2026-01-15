@@ -179,18 +179,30 @@
       log("Brak Web MIDI API w tej przeglądarce. Użyj Chrome/Edge.");
       return;
     }
+
     midiAccess = await navigator.requestMIDIAccess({ sysex: false });
     const inputs = [...midiAccess.inputs.values()];
+
     if (inputs.length === 0) {
       log("Nie wykryto wejść MIDI. Podłącz pianino (USB-OTG) i spróbuj ponownie.");
       return;
     }
 
-    // Bierzemy pierwsze wejście; w wersji produkcyjnej dodasz listę wyboru
-    midiInput = inputs[0];
+    // Pokaż dostępne wejścia (pomaga w diagnostyce)
+    log("Dostępne wejścia MIDI:
+" + inputs.map(i => i.name || "(bez nazwy)").join("
+"));
+
+    // Preferuj FP-10 / Roland, jeśli jest na liście
+    const preferred = inputs.find(i => (i.name || "").toLowerCase().includes("fp-10"))
+      || inputs.find(i => (i.name || "").toLowerCase().includes("fp10"))
+      || inputs.find(i => (i.name || "").toLowerCase().includes("roland"))
+      || inputs[0];
+
+    midiInput = preferred;
     midiInput.onmidimessage = onMidiMessage;
 
-    log(`Połączono MIDI: ${midiInput.name || "wejście MIDI"}.`);
+    log("Połączono MIDI: " + (midiInput.name || "wejście MIDI") + ".");
   }
 
   xmlFileEl.addEventListener("change", async () => {
